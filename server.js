@@ -1,3 +1,4 @@
+require('dotenv').config();
 const express = require("express");
 const mysql = require("mysql2/promise");
 const session = require("express-session");
@@ -12,39 +13,44 @@ const socketio = require("socket.io");
 
 const app = express();
 const server = http.createServer(app);
-const io = socketio(server, {
-  cors: {
-    origin: ["http://localhost:5173", "http://127.0.0.1:5173"],
-    methods: ["GET", "POST"],
-    credentials: true
-  }
-});
 
-const PORT = 5000;
+// Configuration pour Render
+const isProduction = process.env.NODE_ENV === 'production';
+const PORT = process.env.PORT || 5000;
+const FRONTEND_URL = isProduction 
+  ? "https://nexuchat.onrender.com" 
+  : "http://localhost:5173";
 
 // Configuration de la base de données
-const pool = mysql.createPool({
-  host: "localhost",
-  user: "root",
-  password: "",
-  database: "messagerie_app",
+const dbConfig = {
+  host: process.env.DB_HOST || "localhost",
+  user: process.env.DB_USER || "root",
+  password: process.env.DB_PASSWORD || "",
+  database: process.env.DB_NAME || "messagerie_app",
   waitForConnections: true,
   connectionLimit: 10,
   queueLimit: 0,
-});
+};
 
+if (isProduction) {
+  dbConfig.ssl = {
+    rejectUnauthorized: false
+  };
+}
+
+const pool = mysql.createPool(dbConfig);
 const sessionStore = new MySQLStore({}, pool);
 
 // Middlewares
 app.use(cors({ 
-  origin: ["http://localhost:5173", "http://127.0.0.1:5173"], 
+  origin: FRONTEND_URL,
   credentials: true,
   methods: ["GET", "POST", "PUT", "DELETE"],
   allowedHeaders: ["Content-Type", "Authorization"]
 }));
 
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: '25mb' }));
+app.use(express.urlencoded({ extended: true, limit: '25mb' }));
 
 // Configuration des dossiers d'upload
 const uploadsDir = path.join(__dirname, "uploads");
@@ -59,58 +65,63 @@ app.use("/uploads/avatars", express.static(avatarsDir));
 app.use("/uploads/messages", express.static(messagesDir));
 
 // Configuration de Multer
-const uploadAvatar = multer({
-  storage: multer.diskStorage({
-    destination: (req, file, cb) => cb(null, avatarsDir),
-    filename: (req, file, cb) => cb(null, `avatar-${Date.now()}${path.extname(file.originalname)}`),
-  }),
-  fileFilter: (req, file, cb) => {
-    const allowed = ["image/jpeg", "image/png", "image/gif"];
-    if (allowed.includes(file.mimetype)) cb(null, true);
-    else cb(new Error("Seuls JPEG, PNG et GIF sont autorisés."));
+const fileFilter = (req, file, cb) => {
+  const allowedTypes = [
+    'image/jpeg', 'image/png', 'image/gif',
+    'application/pdf',
+    'application/msword',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    'application/vnd.ms-excel',
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    'application/vnd.ms-powerpoint',
+    'application/vnd.openxmlformats-officedocument.presentationml.presentation'
+  ];
+  
+  if (allowedTypes.includes(file.mimetype)) {
+    cb(null, true);
+  } else {
+    cb(new Error("Type de fichier non autorisé"), false);
+  }
+};
+
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    const dest = file.fieldname === 'avatar' ? avatarsDir : messagesDir;
+    cb(null, dest);
   },
-  limits: { fileSize: 25 * 1024 * 1024 },
+  filename: (req, file, cb) => {
+    const prefix = file.fieldname === 'avatar' ? 'avatar-' : 'msg-';
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    cb(null, prefix + uniqueSuffix + path.extname(file.originalname));
+  }
 });
 
-const uploadMessageFile = multer({
-  storage: multer.diskStorage({
-    destination: (req, file, cb) => cb(null, messagesDir),
-    filename: (req, file, cb) => {
-      const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-      cb(null, `msg-${uniqueSuffix}${path.extname(file.originalname)}`);
-    },
-  }),
-  fileFilter: (req, file, cb) => {
-    const allowed = [
-      'image/jpeg', 'image/png', 'image/gif',
-      'application/pdf',
-      'application/msword', 
-      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-      'application/vnd.ms-excel', 
-      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-      'application/vnd.ms-powerpoint', 
-      'application/vnd.openxmlformats-officedocument.presentationml.presentation'
-    ];
-    if (allowed.includes(file.mimetype)) cb(null, true);
-    else cb(new Error("Type de fichier non autorisé"));
-  },
+const uploadAvatar = multer({ 
+  storage,
+  fileFilter,
+  limits: { fileSize: 25 * 1024 * 1024 }
+});
+
+const uploadMessageFile = multer({ 
+  storage,
+  fileFilter,
   limits: { fileSize: 25 * 1024 * 1024 }
 });
 
 // Configuration des sessions
 app.use(
   session({
-    key: "messagerie_session_cookie",
-    secret: "une_cle_secrete_complexe_et_longue",
+    name: "nexuchat.sid",
+    secret: process.env.SESSION_SECRET || "votre_secret_tres_securise",
     store: sessionStore,
     resave: false,
     saveUninitialized: false,
     rolling: true,
     cookie: {
       httpOnly: true,
-      secure: false,
-      sameSite: "lax",
-      maxAge: 24 * 60 * 60 * 1000,
+      secure: isProduction,
+      sameSite: isProduction ? 'none' : 'lax',
+      maxAge: 7 * 24 * 60 * 60 * 1000, // 1 semaine
     },
   })
 );
@@ -123,219 +134,194 @@ const requireAuth = (req, res, next) => {
   next();
 };
 
+// Configuration Socket.io
+const io = socketio(server, {
+  cors: {
+    origin: FRONTEND_URL,
+    methods: ["GET", "POST"],
+    credentials: true
+  }
+});
+
 // Gestion des connexions Socket.io
+const onlineUsers = new Map();
+
 io.use((socket, next) => {
-  const sessionMiddleware = session({
-    key: "messagerie_session_cookie",
-    secret: "une_cle_secrete_complexe_et_longue",
+  session({
+    name: "nexuchat.sid",
+    secret: process.env.SESSION_SECRET || "votre_secret_tres_securise",
     store: sessionStore,
     resave: false,
     saveUninitialized: false,
   })(socket.request, {}, next);
 });
 
-const onlineUsers = new Map();
-
 io.on('connection', async (socket) => {
   const userId = socket.request.session.user?.id;
   if (!userId) return socket.disconnect(true);
 
   onlineUsers.set(userId, socket.id);
-  await pool.query("UPDATE users SET status = 'En ligne' WHERE id = ?", [userId]);
-  io.emit('user-status-changed', { userId, status: 'En ligne' });
+  
+  try {
+    await pool.query("UPDATE users SET status = 'En ligne' WHERE id = ?", [userId]);
+    io.emit('user-status-changed', { userId, status: 'En ligne' });
+  } catch (err) {
+    console.error("Erreur mise à jour statut:", err);
+  }
 
   socket.on('disconnect', async () => {
     onlineUsers.delete(userId);
-    await pool.query("UPDATE users SET status = 'Hors ligne' WHERE id = ?", [userId]);
-    io.emit('user-status-changed', { userId, status: 'Hors ligne' });
-  });
-
-  socket.on('send-message', async ({ conversationId, content, fileData }, callback) => {
     try {
-      const userId = socket.request.session.user.id;
-      const conn = await pool.getConnection();
-      
-      try {
-        await conn.beginTransaction();
-
-        // Vérifier que l'utilisateur fait partie de la conversation
-        const [conversation] = await conn.query(
-          "SELECT user1_id, user2_id FROM conversations WHERE id = ?",
-          [conversationId]
-        );
-        
-        if (conversation.length === 0) {
-          throw new Error("Conversation non trouvée");
-        }
-
-        const { user1_id, user2_id } = conversation[0];
-        if (user1_id !== userId && user2_id !== userId) {
-          throw new Error("Non autorisé");
-        }
-
-        // Insérer le message
-        const [result] = await conn.query(
-          "INSERT INTO messages (conversation_id, sender_id, content) VALUES (?, ?, ?)",
-          [conversationId, userId, content || JSON.stringify(fileData)]
-        );
-
-        // Mettre à jour la conversation avec le dernier message
-        await conn.query(
-          "UPDATE conversations SET last_message_id = ? WHERE id = ?",
-          [result.insertId, conversationId]
-        );
-
-        // Récupérer les détails complets du message
-        const [message] = await conn.query(`
-          SELECT m.id, m.content, m.created_at, m.sender_id, 
-                 u.name as sender_name, u.avatar as sender_avatar,
-                 u.status as sender_status
-          FROM messages m
-          JOIN users u ON m.sender_id = u.id
-          WHERE m.id = ?
-        `, [result.insertId]);
-
-        await conn.commit();
-
-        // Préparer les données du message pour l'émission
-        const messageData = {
-          ...message[0],
-          conversationId,
-          is_read: false
-        };
-
-        // Parser le contenu JSON si c'est un fichier
-        if (messageData.content && messageData.content.startsWith('{') && messageData.content.endsWith('}')) {
-          try {
-            const fileData = JSON.parse(messageData.content);
-            messageData.content = null;
-            messageData.fileUrl = fileData.fileUrl;
-            messageData.fileType = fileData.fileType;
-          } catch (err) {
-            console.error("Erreur parsing file data:", err);
-          }
-        }
-
-        // Émettre le message aux participants de la conversation
-        const otherUserId = user1_id === userId ? user2_id : user1_id;
-        const recipientSocketId = onlineUsers.get(otherUserId);
-        
-        if (recipientSocketId) {
-          io.to(recipientSocketId).emit('new-message', messageData);
-          messageData.is_read = true;
-        }
-
-        // Émettre aussi à l'expéditeur pour confirmation
-        socket.emit('message-sent', messageData);
-
-        // Mettre à jour les conversations des deux utilisateurs
-        const [updatedConv] = await conn.query(`
-          SELECT c.id, 
-                 CASE 
-                   WHEN c.user1_id = ? THEN u2.id 
-                   ELSE u1.id 
-                 END as other_user_id,
-                 CASE 
-                   WHEN c.user1_id = ? THEN u2.name 
-                   ELSE u1.name 
-                 END as other_user_name,
-                 CASE 
-                   WHEN c.user1_id = ? THEN u2.avatar 
-                   ELSE u1.avatar 
-                 END as other_user_avatar,
-                 CASE 
-                   WHEN c.user1_id = ? THEN u2.status 
-                   ELSE u1.status 
-                 END as other_user_status,
-                 m.content as last_message,
-                 m.created_at as last_message_time,
-                 (SELECT COUNT(*) FROM messages WHERE conversation_id = c.id AND sender_id != ? AND read_at IS NULL) as unread_count
-          FROM conversations c
-          JOIN users u1 ON c.user1_id = u1.id
-          JOIN users u2 ON c.user2_id = u2.id
-          LEFT JOIN messages m ON c.last_message_id = m.id
-          WHERE c.id = ?
-        `, [userId, userId, userId, userId, userId, conversationId]);
-
-        if (updatedConv.length > 0) {
-          const conversationUpdate = updatedConv[0];
-          
-          // Émettre la mise à jour de la conversation aux deux utilisateurs
-          io.to(socket.id).emit('conversation-updated', conversationUpdate);
-          if (recipientSocketId) {
-            io.to(recipientSocketId).emit('conversation-updated', {
-              ...conversationUpdate,
-              unread_count: recipientSocketId ? conversationUpdate.unread_count + 1 : 0
-            });
-          }
-        }
-
-        callback({ success: true, message: messageData });
-      } catch (err) {
-        await conn.rollback();
-        throw err;
-      } finally {
-        conn.release();
-      }
+      await pool.query("UPDATE users SET status = 'Hors ligne' WHERE id = ?", [userId]);
+      io.emit('user-status-changed', { userId, status: 'Hors ligne' });
     } catch (err) {
-      console.error("Erreur envoi message via socket:", err);
-      callback({ success: false, message: "Erreur lors de l'envoi du message" });
+      console.error("Erreur mise à jour statut:", err);
     }
   });
 
-  socket.on('mark-as-read', async ({ conversationId }) => {
-    try {
-      const userId = socket.request.session.user.id;
-      
-      await pool.query(
-        "UPDATE messages SET read_at = NOW() WHERE conversation_id = ? AND sender_id != ? AND read_at IS NULL",
-        [conversationId, userId]
-      );
-
-      // Mettre à jour la conversation avec le nouveau nombre de messages non lus
-      const [conversation] = await pool.query(`
-        SELECT c.id, 
-               CASE 
-                 WHEN c.user1_id = ? THEN u2.id 
-                 ELSE u1.id 
-               END as other_user_id,
-               CASE 
-                 WHEN c.user1_id = ? THEN u2.name 
-                 ELSE u1.name 
-               END as other_user_name,
-               CASE 
-                 WHEN c.user1_id = ? THEN u2.avatar 
-                 ELSE u1.avatar 
-               END as other_user_avatar,
-               CASE 
-                 WHEN c.user1_id = ? THEN u2.status 
-                 ELSE u1.status 
-               END as other_user_status,
-               m.content as last_message,
-               m.created_at as last_message_time,
-               0 as unread_count
-        FROM conversations c
-        JOIN users u1 ON c.user1_id = u1.id
-        JOIN users u2 ON c.user2_id = u2.id
-        LEFT JOIN messages m ON c.last_message_id = m.id
-        WHERE c.id = ?
-      `, [userId, userId, userId, userId, conversationId]);
-
-      if (conversation.length > 0) {
-        socket.emit('conversation-updated', conversation[0]);
-        
-        // Informer l'autre utilisateur que ses messages ont été lus
-        const otherUserId = conversation[0].other_user_id;
-        const recipientSocketId = onlineUsers.get(otherUserId);
-        if (recipientSocketId) {
-          io.to(recipientSocketId).emit('messages-read', { conversationId, readerId: userId });
-        }
-      }
-    } catch (err) {
-      console.error("Erreur marquage messages comme lus:", err);
-    }
-  });
+  // Gestion des messages
+  socket.on('send-message', handleSendMessage);
+  socket.on('mark-as-read', handleMarkAsRead);
 });
+
+// Fonctions de gestion Socket.io
+async function handleSendMessage({ conversationId, content }, callback) {
+  try {
+    const socket = this;
+    const userId = socket.request.session.user.id;
+    
+    const [conversation] = await pool.query(
+      "SELECT user1_id, user2_id FROM conversations WHERE id = ?",
+      [conversationId]
+    );
+    
+    if (conversation.length === 0) {
+      throw new Error("Conversation non trouvée");
+    }
+
+    const { user1_id, user2_id } = conversation[0];
+    if (user1_id !== userId && user2_id !== userId) {
+      throw new Error("Non autorisé");
+    }
+
+    const [result] = await pool.query(
+      "INSERT INTO messages (conversation_id, sender_id, content) VALUES (?, ?, ?)",
+      [conversationId, userId, content]
+    );
+
+    await pool.query(
+      "UPDATE conversations SET last_message_id = ? WHERE id = ?",
+      [result.insertId, conversationId]
+    );
+
+    const [message] = await pool.query(`
+      SELECT m.id, m.content, m.created_at, m.sender_id, 
+             u.name as sender_name, u.avatar as sender_avatar
+      FROM messages m
+      JOIN users u ON m.sender_id = u.id
+      WHERE m.id = ?
+    `, [result.insertId]);
+
+    const messageData = {
+      ...message[0],
+      conversationId,
+      is_read: false
+    };
+
+    const otherUserId = user1_id === userId ? user2_id : user1_id;
+    const recipientSocketId = onlineUsers.get(otherUserId);
+    
+    if (recipientSocketId) {
+      io.to(recipientSocketId).emit('new-message', messageData);
+      messageData.is_read = true;
+    }
+
+    socket.emit('message-sent', messageData);
+    updateConversationForUsers(userId, otherUserId, conversationId);
+
+    callback({ success: true, message: messageData });
+  } catch (err) {
+    console.error("Erreur envoi message:", err);
+    callback({ success: false, message: "Erreur lors de l'envoi du message" });
+  }
+}
+
+async function handleMarkAsRead({ conversationId }) {
+  try {
+    const socket = this;
+    const userId = socket.request.session.user.id;
+    
+    await pool.query(
+      "UPDATE messages SET read_at = NOW() WHERE conversation_id = ? AND sender_id != ? AND read_at IS NULL",
+      [conversationId, userId]
+    );
+
+    const [conversation] = await pool.query(`
+      SELECT c.user1_id, c.user2_id 
+      FROM conversations c
+      WHERE c.id = ?
+    `, [conversationId]);
+
+    if (conversation.length > 0) {
+      const { user1_id, user2_id } = conversation[0];
+      const otherUserId = user1_id === userId ? user2_id : user1_id;
+      
+      updateConversationForUsers(userId, otherUserId, conversationId);
+    }
+  } catch (err) {
+    console.error("Erreur marquage messages comme lus:", err);
+  }
+}
+
+async function updateConversationForUsers(userId, otherUserId, conversationId) {
+  try {
+    const [conversation] = await pool.query(`
+      SELECT c.id, 
+             CASE 
+               WHEN c.user1_id = ? THEN u2.id 
+               ELSE u1.id 
+             END as other_user_id,
+             CASE 
+               WHEN c.user1_id = ? THEN u2.name 
+               ELSE u1.name 
+             END as other_user_name,
+             CASE 
+               WHEN c.user1_id = ? THEN u2.avatar 
+               ELSE u1.avatar 
+             END as other_user_avatar,
+             CASE 
+               WHEN c.user1_id = ? THEN u2.status 
+               ELSE u1.status 
+             END as other_user_status,
+             m.content as last_message,
+             m.created_at as last_message_time,
+             (SELECT COUNT(*) FROM messages WHERE conversation_id = c.id AND sender_id != ? AND read_at IS NULL) as unread_count
+      FROM conversations c
+      JOIN users u1 ON c.user1_id = u1.id
+      JOIN users u2 ON c.user2_id = u2.id
+      LEFT JOIN messages m ON c.last_message_id = m.id
+      WHERE c.id = ?
+    `, [userId, userId, userId, userId, userId, conversationId]);
+
+    if (conversation.length > 0) {
+      const convData = conversation[0];
+      const senderSocketId = onlineUsers.get(userId);
+      const recipientSocketId = onlineUsers.get(otherUserId);
+
+      if (senderSocketId) {
+        io.to(senderSocketId).emit('conversation-updated', convData);
+      }
+      if (recipientSocketId) {
+        io.to(recipientSocketId).emit('conversation-updated', {
+          ...convData,
+          unread_count: 0
+        });
+      }
+    }
+  } catch (err) {
+    console.error("Erreur mise à jour conversation:", err);
+  }
+}
 
 // Routes API
 app.get("/api/check-auth", async (req, res) => {
@@ -344,14 +330,19 @@ app.get("/api/check-auth", async (req, res) => {
   }
 
   try {
-    const [rows] = await pool.query("SELECT id, name, email, avatar, status FROM users WHERE id = ?", [req.session.user.id]);
+    const [rows] = await pool.query(
+      "SELECT id, name, email, avatar, status FROM users WHERE id = ?", 
+      [req.session.user.id]
+    );
+    
     if (rows.length === 0) {
       return res.json({ isAuthenticated: false });
     }
 
     const user = rows[0];
     req.session.user = { ...req.session.user, status: user.status };
-    return res.json({ 
+    
+    res.json({ 
       isAuthenticated: true, 
       user: {
         id: user.id,
@@ -369,34 +360,57 @@ app.get("/api/check-auth", async (req, res) => {
 
 app.post("/api/register", uploadAvatar.single("avatar"), async (req, res) => {
   const { name, email, password } = req.body;
+  
   if (!name || !email || !password) {
     if (req.file) fs.unlinkSync(req.file.path);
-    return res.status(400).json({ success: false, message: "Tous les champs sont requis" });
+    return res.status(400).json({ 
+      success: false, 
+      message: "Tous les champs sont requis" 
+    });
   }
 
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
-    const [existing] = await conn.query("SELECT id FROM users WHERE email = ?", [email]);
+    
+    const [existing] = await conn.query(
+      "SELECT id FROM users WHERE email = ?", 
+      [email]
+    );
+    
     if (existing.length > 0) {
       if (req.file) fs.unlinkSync(req.file.path);
-      return res.status(409).json({ success: false, message: "Email déjà utilisé" });
+      return res.status(409).json({ 
+        success: false, 
+        message: "Email déjà utilisé" 
+      });
     }
 
     const hashedPassword = await bcrypt.hash(password, 12);
-    const avatar = req.file ? `/uploads/avatars/${req.file.filename}` : "/uploads/avatars/default.jpg";
+    const avatar = req.file 
+      ? `/uploads/avatars/${req.file.filename}` 
+      : "/uploads/avatars/default.jpg";
 
     await conn.query(
-      "INSERT INTO users (name, email, password, avatar, status, bio, phone, location) VALUES (?, ?, ?, ?, 'Hors ligne', '', '', '')", 
+      `INSERT INTO users 
+       (name, email, password, avatar, status, bio, phone, location) 
+       VALUES (?, ?, ?, ?, 'Hors ligne', '', '', '')`, 
       [name, email, hashedPassword, avatar]
     );
+    
     await conn.commit();
-    res.status(201).json({ success: true, message: "Inscription réussie" });
+    res.status(201).json({ 
+      success: true, 
+      message: "Inscription réussie" 
+    });
   } catch (err) {
     await conn.rollback();
     console.error("Erreur inscription:", err);
     if (req.file) fs.unlinkSync(req.file.path);
-    res.status(500).json({ success: false, message: "Erreur lors de l'inscription" });
+    res.status(500).json({ 
+      success: false, 
+      message: "Erreur lors de l'inscription" 
+    });
   } finally {
     conn.release();
   }
@@ -808,17 +822,19 @@ app.post("/api/messages/upload", requireAuth, uploadMessageFile.single("file"), 
     conn.release();
   }
 });
-
 // Démarrer le serveur
 server.listen(PORT, () => {
-  console.log(`Serveur démarré sur http://localhost:${PORT}`);
+  console.log(`Serveur démarré sur le port ${PORT}`);
+  console.log(`Environnement: ${isProduction ? 'Production' : 'Développement'}`);
+  console.log(`URL Frontend: ${FRONTEND_URL}`);
 });
 
-// Gestion des erreurs non capturées
+// Gestion des erreurs
 process.on('unhandledRejection', (err) => {
   console.error('Unhandled Rejection:', err);
 });
 
 process.on('uncaughtException', (err) => {
   console.error('Uncaught Exception:', err);
+  process.exit(1);
 });
