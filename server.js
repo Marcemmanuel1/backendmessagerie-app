@@ -146,8 +146,8 @@ const requireAuth = async (req, res, next) => {
 };
 
 // Gestion des connexions Socket.io
-const onlineUsers = new Map(); // { userId: socketId }
-const userSockets = new Map(); // { userId: Set(socketId1, socketId2) }
+const onlineUsers = new Map();
+const userSockets = new Map();
 
 io.use((socket, next) => {
   const token = socket.handshake.auth.token;
@@ -199,7 +199,6 @@ const setupSocketIO = () => {
         const sockets = userSockets.get(userId);
         sockets.delete(socket.id);
         
-        // Si c'était la dernière connexion de cet utilisateur
         if (sockets.size === 0) {
           userSockets.delete(userId);
           onlineUsers.delete(userId);
@@ -214,7 +213,7 @@ const setupSocketIO = () => {
       }
     });
 
-    // Rejoindre les rooms des conversations de l'utilisateur
+    // Rejoindre les rooms des conversations
     socket.on('join-conversations', async () => {
       try {
         const [conversations] = await pool.query(
@@ -232,8 +231,9 @@ const setupSocketIO = () => {
 
     // Gestion des messages
     socket.on('send-message', async ({ conversationId, content }, callback) => {
+      let conn;
       try {
-        const conn = await pool.getConnection();
+        conn = await pool.getConnection();
         await conn.beginTransaction();
 
         // Vérification de la conversation
@@ -268,7 +268,8 @@ const setupSocketIO = () => {
         // Récupération des détails du message
         const [message] = await conn.query(`
           SELECT m.id, m.content, m.created_at, m.sender_id, 
-                 u.name as sender_name, u.avatar as sender_avatar
+                 u.name as sender_name, u.avatar as sender_avatar,
+                 u.status as sender_status
           FROM messages m
           JOIN users u ON m.sender_id = u.id
           WHERE m.id = ?
@@ -283,17 +284,20 @@ const setupSocketIO = () => {
           is_read: false
         };
 
-        // Émission du message à la room de conversation
+        // Émission du message
         io.to(`conversation_${conversationId}`).emit('new-message', messageData);
 
-        // Mise à jour des conversations pour les deux utilisateurs
+        // Mise à jour des conversations
         const otherUserId = user1_id === userId ? user2_id : user1_id;
         await updateConversationForUsers(conn, conversationId, userId, otherUserId);
 
         callback({ success: true, message: messageData });
       } catch (err) {
         console.error("Erreur envoi message:", err);
+        if (conn) await conn.rollback();
         callback({ success: false, message: "Erreur lors de l'envoi du message" });
+      } finally {
+        if (conn) conn.release();
       }
     });
 
@@ -305,16 +309,7 @@ const setupSocketIO = () => {
           [conversationId, userId]
         );
 
-        // Mise à jour de la conversation
-        const [conversation] = await pool.query(
-          "SELECT user1_id, user2_id FROM conversations WHERE id = ?",
-          [conversationId]
-        );
-
-        if (conversation.length > 0) {
-          // Informer les participants de la conversation
-          io.to(`conversation_${conversationId}`).emit('messages-read', { conversationId });
-        }
+        io.to(`conversation_${conversationId}`).emit('messages-read', { conversationId });
       } catch (err) {
         console.error("Erreur marquage messages comme lus:", err);
       }
@@ -364,7 +359,7 @@ const updateConversationForUsers = async (conn, conversationId, userId, otherUse
         });
       }
       
-      // Émettre à l'autre utilisateur avec un unread_count incrémenté si c'est un nouveau message
+      // Émettre à l'autre utilisateur
       if (userSockets.has(otherUserId)) {
         userSockets.get(otherUserId).forEach(socketId => {
           io.to(socketId).emit('conversation-updated', {
