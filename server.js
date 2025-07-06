@@ -110,18 +110,17 @@ const uploadMessageFile = multer({
 // Middleware d'authentification JWT
 const requireAuth = (req, res, next) => {
   const authHeader = req.headers['authorization'];
+  console.log("Authorization header:", authHeader); // <-- Ajoute ce log
   if (!authHeader) {
     return res.status(401).json({ success: false, message: "Non authentifié. Jeton manquant." });
   }
-
-  const token = authHeader.split(' ')[1]; // Expected format: "Bearer TOKEN"
+  const token = authHeader.split(' ')[1];
   if (!token) {
     return res.status(401).json({ success: false, message: "Non authentifié. Format de jeton invalide." });
   }
-
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    req.user = decoded; // Attach the decoded payload to the request
+    req.user = decoded;
     next();
   } catch (err) {
     console.error("Erreur de vérification du jeton:", err);
@@ -349,6 +348,7 @@ async function updateConversationForUsers(userId, otherUserId, conversationId) {
 
 // Routes API
 app.get("/api/check-auth", requireAuth, async (req, res) => {
+  console.log("User après requireAuth:", req.user); // <-- Ajoute ce log
   try {
     // req.user is populated by requireAuth middleware
     const userId = req.user.id;
@@ -448,37 +448,39 @@ app.post("/api/login", async (req, res) => {
   try {
     await conn.beginTransaction();
     const [rows] = await conn.query("SELECT * FROM users WHERE email = ?", [email]);
-    if (rows.length === 0) return res.status(401).json({ success: false, message: "Identifiants incorrects" });
+    if (rows.length === 0) {
+      return res.status(401).json({ success: false, message: "Utilisateur non trouvé" });
+    }
 
     const user = rows[0];
     const validPass = await bcrypt.compare(password, user.password);
-    if (!validPass) return res.status(401).json({ success: false, message: "Identifiants incorrects" });
+    if (!validPass) {
+      return res.status(401).json({ success: false, message: "Mot de passe incorrect" });
+    }
 
-    await conn.query("UPDATE users SET status = 'En ligne' WHERE id = ?", [user.id]);
-    await conn.commit();
-
-    // Generate JWT
+    // Génération du token JWT
     const token = jwt.sign(
-      { id: user.id, name: user.name, email: user.email, avatar: user.avatar, status: "En ligne" },
+      { id: user.id, name: user.name, email: user.email },
       process.env.JWT_SECRET,
-      { expiresIn: '7d' } // Token expires in 7 days
+      { expiresIn: process.env.JWT_EXPIRATION || "7d" }
     );
 
+    await conn.commit();
     res.json({
       success: true,
-      token, // Send the token to the client
+      token,
       user: {
         id: user.id,
         name: user.name,
         email: user.email,
         avatar: user.avatar,
-        status: "En ligne"
+        status: user.status
       }
     });
   } catch (err) {
     await conn.rollback();
-    console.error("Erreur connexion:", err);
-    res.status(500).json({ success: false, message: "Erreur lors de la connexion" });
+    console.error("Erreur login:", err);
+    res.status(500).json({ success: false, message: "Erreur serveur" });
   } finally {
     conn.release();
   }
@@ -901,3 +903,5 @@ process.on('uncaughtException', (err) => {
   console.error('Uncaught Exception:', err);
   process.exit(1);
 });
+
+localStorage.setItem('token', data.token);
