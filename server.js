@@ -1,8 +1,6 @@
 require('dotenv').config();
 const express = require("express");
 const mysql = require("mysql2/promise");
-const session = require("express-session");
-const MySQLStore = require("express-mysql-session")(session);
 const bcrypt = require("bcryptjs");
 const cors = require("cors");
 const multer = require("multer");
@@ -11,6 +9,7 @@ const fs = require("fs").promises;
 const http = require("http");
 const socketio = require("socket.io");
 const { v4: uuidv4 } = require("uuid");
+const jwt = require("jsonwebtoken");
 
 // Initialisation de l'application
 const app = express();
@@ -40,7 +39,6 @@ const dbConfig = {
 };
 
 const pool = mysql.createPool(dbConfig);
-const sessionStore = new MySQLStore({}, pool);
 
 // Middlewares
 app.use(cors({
@@ -52,6 +50,10 @@ app.use(cors({
 
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// Configuration JWT
+const JWT_SECRET = process.env.JWT_SECRET || "une_cle_secrete_complexe_et_longue";
+const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || "1d";
 
 // Configuration des dossiers d'upload
 const configureDirectories = async () => {
@@ -111,106 +113,120 @@ const uploadMessageFile = multer({
   limits: { fileSize: 25 * 1024 * 1024 }
 });
 
-// Configuration de la session
-app.use(session({
-  key: "messagerie_session_cookie",
-  secret: process.env.SESSION_SECRET || "une_cle_secrete_complexe_et_longue",
-  store: sessionStore,
-  resave: false,
-  saveUninitialized: false,
-  rolling: true,
-  cookie: {
-    httpOnly: true,
-    secure: process.env.NODE_ENV === "production",
-    sameSite: process.env.NODE_ENV === "production" ? "none" : "lax",
-    maxAge: 24 * 60 * 60 * 1000
-  }
-}));
-
-// Middleware d'authentification
+// Middleware d'authentification JWT
 const requireAuth = async (req, res, next) => {
-  if (!req.session.user) {
-    return res.status(401).json({ success: false, message: "Non authentifié" });
-  }
-
   try {
+    const token = req.headers.authorization?.split(' ')[1];
+    
+    if (!token) {
+      return res.status(401).json({ success: false, message: "Token manquant" });
+    }
+
+    const decoded = jwt.verify(token, JWT_SECRET);
+    
+    // Vérification que l'utilisateur existe toujours
     const [rows] = await pool.query(
       "SELECT id FROM users WHERE id = ?",
-      [req.session.user.id]
+      [decoded.userId]
     );
     
     if (rows.length === 0) {
-      req.session.destroy();
-      return res.status(401).json({ success: false, message: "Session invalide" });
+      return res.status(401).json({ success: false, message: "Utilisateur non trouvé" });
     }
     
+    req.userId = decoded.userId;
     next();
   } catch (err) {
-    console.error("Erreur vérification auth:", err);
-    res.status(500).json({ success: false, message: "Erreur serveur" });
+    console.error("Erreur vérification token:", err);
+    if (err.name === 'TokenExpiredError') {
+      return res.status(401).json({ success: false, message: "Token expiré" });
+    }
+    res.status(401).json({ success: false, message: "Token invalide" });
   }
 };
 
 // Gestion des connexions Socket.io
-const onlineUsers = new Map();
+const onlineUsers = new Map(); // { userId: socketId }
+const userSockets = new Map(); // { userId: Set(socketId1, socketId2) }
 
 io.use((socket, next) => {
-  session({
-    key: "messagerie_session_cookie",
-    secret: process.env.SESSION_SECRET || "une_cle_secrete_complexe_et_longue",
-    store: sessionStore,
-    resave: false,
-    saveUninitialized: false,
-  })(socket.request, {}, (err) => {
-    if (err) return next(err);
-    
-    if (!socket.request.session || !socket.request.session.user) {
-      return next(new Error('Non authentifié'));
+  const token = socket.handshake.auth.token;
+  
+  if (!token) {
+    return next(new Error('Authentification requise'));
+  }
+
+  jwt.verify(token, JWT_SECRET, (err, decoded) => {
+    if (err) {
+      return next(new Error('Authentification invalide'));
     }
     
+    socket.userId = decoded.userId;
     next();
   });
 });
 
 const setupSocketIO = () => {
   io.on('connection', async (socket) => {
-    const userId = socket.request.session.user?.id;
+    const userId = socket.userId;
     if (!userId) return socket.disconnect(true);
 
     console.log(`Nouvelle connexion Socket.io - User ID: ${userId}`);
 
     // Gestion des connexions multiples
-    const existingSocketId = onlineUsers.get(userId);
-    if (existingSocketId) {
-      const existingSocket = io.sockets.sockets.get(existingSocketId);
-      if (existingSocket) {
-        existingSocket.disconnect(true);
-      }
+    if (!userSockets.has(userId)) {
+      userSockets.set(userId, new Set());
     }
-
-    onlineUsers.set(userId, socket.id);
-
-    try {
-      await pool.query("UPDATE users SET status = 'En ligne' WHERE id = ?", [userId]);
-      io.emit('user-status-changed', { userId, status: 'En ligne' });
-    } catch (err) {
-      console.error("Erreur mise à jour statut en ligne:", err);
+    userSockets.get(userId).add(socket.id);
+    
+    // Mise à jour de la liste des utilisateurs en ligne
+    if (!onlineUsers.has(userId)) {
+      onlineUsers.set(userId, socket.id);
+      
+      try {
+        await pool.query("UPDATE users SET status = 'En ligne' WHERE id = ?", [userId]);
+        io.emit('user-status-changed', { userId, status: 'En ligne' });
+      } catch (err) {
+        console.error("Erreur mise à jour statut en ligne:", err);
+      }
     }
 
     // Gestion des déconnexions
     socket.on('disconnect', async (reason) => {
       console.log(`Déconnexion - User ID: ${userId}, Raison: ${reason}`);
 
-      // Vérifier si c'est la dernière connexion de cet utilisateur
-      if (onlineUsers.get(userId) === socket.id) {
-        onlineUsers.delete(userId);
+      if (userSockets.has(userId)) {
+        const sockets = userSockets.get(userId);
+        sockets.delete(socket.id);
+        
+        // Si c'était la dernière connexion de cet utilisateur
+        if (sockets.size === 0) {
+          userSockets.delete(userId);
+          onlineUsers.delete(userId);
 
-        try {
-          await pool.query("UPDATE users SET status = 'Hors ligne' WHERE id = ?", [userId]);
-          io.emit('user-status-changed', { userId, status: 'Hors ligne' });
-        } catch (err) {
-          console.error("Erreur mise à jour statut hors ligne:", err);
+          try {
+            await pool.query("UPDATE users SET status = 'Hors ligne' WHERE id = ?", [userId]);
+            io.emit('user-status-changed', { userId, status: 'Hors ligne' });
+          } catch (err) {
+            console.error("Erreur mise à jour statut hors ligne:", err);
+          }
         }
+      }
+    });
+
+    // Rejoindre les rooms des conversations de l'utilisateur
+    socket.on('join-conversations', async () => {
+      try {
+        const [conversations] = await pool.query(
+          "SELECT id FROM conversations WHERE user1_id = ? OR user2_id = ?",
+          [userId, userId]
+        );
+        
+        conversations.forEach(conv => {
+          socket.join(`conversation_${conv.id}`);
+        });
+      } catch (err) {
+        console.error("Erreur rejoindre conversations:", err);
       }
     });
 
@@ -267,21 +283,11 @@ const setupSocketIO = () => {
           is_read: false
         };
 
-        // Émission du message
+        // Émission du message à la room de conversation
+        io.to(`conversation_${conversationId}`).emit('new-message', messageData);
+
+        // Mise à jour des conversations pour les deux utilisateurs
         const otherUserId = user1_id === userId ? user2_id : user1_id;
-        const recipientSocketId = onlineUsers.get(otherUserId);
-        
-        if (recipientSocketId) {
-          io.to(recipientSocketId).emit('new-message', messageData);
-        }
-
-        // Confirmation à l'expéditeur
-        socket.emit('message-sent', {
-          ...messageData,
-          is_read: !!recipientSocketId
-        });
-
-        // Mise à jour des conversations
         await updateConversationForUsers(conn, conversationId, userId, otherUserId);
 
         callback({ success: true, message: messageData });
@@ -306,14 +312,8 @@ const setupSocketIO = () => {
         );
 
         if (conversation.length > 0) {
-          const { user1_id, user2_id } = conversation[0];
-          const otherUserId = user1_id === userId ? user2_id : user1_id;
-          
-          // Informer l'autre utilisateur
-          const recipientSocketId = onlineUsers.get(otherUserId);
-          if (recipientSocketId) {
-            io.to(recipientSocketId).emit('messages-read', { conversationId });
-          }
+          // Informer les participants de la conversation
+          io.to(`conversation_${conversationId}`).emit('messages-read', { conversationId });
         }
       } catch (err) {
         console.error("Erreur marquage messages comme lus:", err);
@@ -324,72 +324,81 @@ const setupSocketIO = () => {
 
 // Fonction utilitaire pour mettre à jour les conversations
 const updateConversationForUsers = async (conn, conversationId, userId, otherUserId) => {
-  const [conversation] = await conn.query(`
-    SELECT c.id, 
-           CASE 
-             WHEN c.user1_id = ? THEN u2.id 
-             ELSE u1.id 
-           END as other_user_id,
-           CASE 
-             WHEN c.user1_id = ? THEN u2.name 
-             ELSE u1.name 
-           END as other_user_name,
-           CASE 
-             WHEN c.user1_id = ? THEN u2.avatar 
-             ELSE u1.avatar 
-           END as other_user_avatar,
-           CASE 
-             WHEN c.user1_id = ? THEN u2.status 
-             ELSE u1.status 
-           END as other_user_status,
-           m.content as last_message,
-           m.created_at as last_message_time,
-           (SELECT COUNT(*) FROM messages WHERE conversation_id = c.id AND sender_id != ? AND read_at IS NULL) as unread_count
-    FROM conversations c
-    JOIN users u1 ON c.user1_id = u1.id
-    JOIN users u2 ON c.user2_id = u2.id
-    LEFT JOIN messages m ON c.last_message_id = m.id
-    WHERE c.id = ?
-  `, [userId, userId, userId, userId, userId, conversationId]);
+  try {
+    // Récupération des données de conversation pour l'utilisateur actuel
+    const [conversation] = await conn.query(`
+      SELECT c.id, 
+             CASE 
+               WHEN c.user1_id = ? THEN u2.id 
+               ELSE u1.id 
+             END as other_user_id,
+             CASE 
+               WHEN c.user1_id = ? THEN u2.name 
+               ELSE u1.name 
+             END as other_user_name,
+             CASE 
+               WHEN c.user1_id = ? THEN u2.avatar 
+               ELSE u1.avatar 
+             END as other_user_avatar,
+             CASE 
+               WHEN c.user1_id = ? THEN u2.status 
+               ELSE u1.status 
+             END as other_user_status,
+             m.content as last_message,
+             m.created_at as last_message_time,
+             (SELECT COUNT(*) FROM messages WHERE conversation_id = c.id AND sender_id != ? AND read_at IS NULL) as unread_count
+      FROM conversations c
+      JOIN users u1 ON c.user1_id = u1.id
+      JOIN users u2 ON c.user2_id = u2.id
+      LEFT JOIN messages m ON c.last_message_id = m.id
+      WHERE c.id = ?
+    `, [userId, userId, userId, userId, userId, conversationId]);
 
-  if (conversation.length > 0) {
-    const convData = conversation[0];
-    const recipientSocketId = onlineUsers.get(otherUserId);
-    
-    // Émettre à l'utilisateur actuel
-    io.to(onlineUsers.get(userId)).emit('conversation-updated', convData);
-    
-    // Émettre à l'autre utilisateur avec un unread_count incrémenté
-    if (recipientSocketId) {
-      io.to(recipientSocketId).emit('conversation-updated', {
-        ...convData,
-        unread_count: convData.unread_count + 1
-      });
+    if (conversation.length > 0) {
+      const convData = conversation[0];
+      
+      // Émettre à l'utilisateur actuel
+      if (userSockets.has(userId)) {
+        userSockets.get(userId).forEach(socketId => {
+          io.to(socketId).emit('conversation-updated', convData);
+        });
+      }
+      
+      // Émettre à l'autre utilisateur avec un unread_count incrémenté si c'est un nouveau message
+      if (userSockets.has(otherUserId)) {
+        userSockets.get(otherUserId).forEach(socketId => {
+          io.to(socketId).emit('conversation-updated', {
+            ...convData,
+            unread_count: convData.unread_count + 1
+          });
+        });
+      }
     }
+  } catch (err) {
+    console.error("Erreur mise à jour conversation:", err);
   }
+};
+
+// Fonction pour générer un token JWT
+const generateToken = (userId) => {
+  return jwt.sign({ userId }, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
 };
 
 // Routes API
 const setupRoutes = () => {
   // Vérification d'authentification
-  app.get("/api/check-auth", async (req, res) => {
+  app.get("/api/check-auth", requireAuth, async (req, res) => {
     try {
-      if (!req.session.user) {
-        return res.json({ isAuthenticated: false });
-      }
-
       const [rows] = await pool.query(
         "SELECT id, name, email, avatar, status FROM users WHERE id = ?",
-        [req.session.user.id]
+        [req.userId]
       );
       
       if (rows.length === 0) {
-        req.session.destroy();
-        return res.json({ isAuthenticated: false });
+        return res.status(404).json({ isAuthenticated: false });
       }
 
       const user = rows[0];
-      req.session.user = { ...req.session.user, status: user.status };
       
       res.json({ 
         isAuthenticated: true, 
@@ -399,7 +408,8 @@ const setupRoutes = () => {
           email: user.email,
           avatar: user.avatar,
           status: user.status
-        }
+        },
+        token: generateToken(user.id)
       });
     } catch (err) {
       console.error("Erreur vérification auth:", err);
@@ -449,12 +459,23 @@ const setupRoutes = () => {
         [name, email, hashedPassword, avatar]
       );
 
+      const userId = result.insertId;
+      const token = generateToken(userId);
+
       await conn.commit();
       
       res.status(201).json({ 
         success: true, 
         message: "Inscription réussie",
-        userId: result.insertId
+        userId,
+        token,
+        user: {
+          id: userId,
+          name,
+          email,
+          avatar,
+          status: 'Hors ligne'
+        }
       });
     } catch (err) {
       await conn.rollback();
@@ -512,19 +533,14 @@ const setupRoutes = () => {
         [user.id]
       );
 
-      // Création de la session
-      req.session.user = { 
-        id: user.id, 
-        name: user.name, 
-        email: user.email, 
-        avatar: user.avatar, 
-        status: "En ligne" 
-      };
+      // Génération du token JWT
+      const token = generateToken(user.id);
 
       await conn.commit();
       
       res.json({ 
         success: true, 
+        token,
         user: {
           id: user.id,
           name: user.name,
@@ -553,25 +569,14 @@ const setupRoutes = () => {
       
       await conn.query(
         "UPDATE users SET status = 'Hors ligne' WHERE id = ?", 
-        [req.session.user.id]
+        [req.userId]
       );
 
       await conn.commit();
       
-      req.session.destroy(err => {
-        if (err) {
-          console.error("Erreur destruction session:", err);
-          return res.status(500).json({ 
-            success: false, 
-            message: "Erreur lors de la déconnexion" 
-          });
-        }
-        
-        res.clearCookie("messagerie_session_cookie");
-        res.json({ 
-          success: true, 
-          message: "Déconnexion réussie" 
-        });
+      res.json({ 
+        success: true, 
+        message: "Déconnexion réussie" 
       });
     } catch (err) {
       await conn.rollback();
@@ -593,7 +598,7 @@ const setupRoutes = () => {
          FROM users 
          WHERE id != ? 
          ORDER BY name ASC`, 
-        [req.session.user.id]
+        [req.userId]
       );
       
       res.json({ success: true, users });
@@ -613,7 +618,7 @@ const setupRoutes = () => {
         `SELECT id, name, email, avatar, status, bio, phone, location 
          FROM users 
          WHERE id = ?`, 
-        [req.session.user.id]
+        [req.userId]
       );
       
       if (rows.length === 0) {
@@ -636,22 +641,35 @@ const setupRoutes = () => {
   // Mise à jour du profil
   app.put("/api/profile", requireAuth, uploadAvatar.single("avatar"), async (req, res) => {
     const { name, bio, phone, location } = req.body;
-    const userId = req.session.user.id;
+    const userId = req.userId;
 
     const conn = await pool.getConnection();
     try {
       await conn.beginTransaction();
 
-      let avatar = req.session.user.avatar;
+      // Récupération de l'utilisateur actuel
+      const [currentUser] = await conn.query(
+        "SELECT avatar FROM users WHERE id = ?",
+        [userId]
+      );
+      
+      if (currentUser.length === 0) {
+        return res.status(404).json({ 
+          success: false, 
+          message: "Utilisateur non trouvé" 
+        });
+      }
+
+      let avatar = currentUser[0].avatar;
       
       // Gestion de la nouvelle image
       if (req.file) {
         avatar = `/uploads/avatars/${req.file.filename}`;
         
         // Suppression de l'ancienne image si ce n'est pas l'image par défaut
-        if (req.session.user.avatar && !req.session.user.avatar.includes('default.jpg')) {
+        if (currentUser[0].avatar && !currentUser[0].avatar.includes('default.jpg')) {
           try {
-            await fs.unlink(path.join(__dirname, req.session.user.avatar));
+            await fs.unlink(path.join(__dirname, currentUser[0].avatar));
           } catch (err) {
             console.error("Erreur suppression ancien avatar:", err);
           }
@@ -666,27 +684,18 @@ const setupRoutes = () => {
         [name, bio, phone, location, avatar, userId]
       );
 
-      // Mise à jour de la session
-      req.session.user = {
-        ...req.session.user,
-        name,
-        avatar
-      };
-
       await conn.commit();
       
+      // Récupération des données mises à jour
+      const [updatedUser] = await conn.query(
+        "SELECT id, name, email, avatar, status, bio, phone, location FROM users WHERE id = ?",
+        [userId]
+      );
+
       res.json({ 
         success: true, 
-        user: {
-          id: userId,
-          name,
-          email: req.session.user.email,
-          avatar,
-          status: req.session.user.status,
-          bio,
-          phone,
-          location
-        } 
+        user: updatedUser[0],
+        token: generateToken(userId) // Renvoie un nouveau token avec les données mises à jour
       });
     } catch (err) {
       await conn.rollback();
@@ -704,7 +713,7 @@ const setupRoutes = () => {
   // Récupération des conversations
   app.get("/api/conversations", requireAuth, async (req, res) => {
     try {
-      const userId = req.session.user.id;
+      const userId = req.userId;
       
       const [conversations] = await pool.query(`
         SELECT c.id, 
@@ -748,7 +757,7 @@ const setupRoutes = () => {
   // Récupération ou création d'une conversation
   app.get("/api/conversations/:otherUserId", requireAuth, async (req, res) => {
     try {
-      const userId = req.session.user.id;
+      const userId = req.userId;
       const otherUserId = req.params.otherUserId;
 
       // Vérification de l'existence de la conversation
@@ -775,11 +784,60 @@ const setupRoutes = () => {
           [userId, otherUserId]
         );
         
+        const conversationId = result.insertId;
+
+        // Récupération des détails de la conversation
+        const [newConversation] = await conn.query(`
+          SELECT c.id, 
+                 CASE 
+                   WHEN c.user1_id = ? THEN u2.id 
+                   ELSE u1.id 
+                 END as other_user_id,
+                 CASE 
+                   WHEN c.user1_id = ? THEN u2.name 
+                   ELSE u1.name 
+                 END as other_user_name,
+                 CASE 
+                   WHEN c.user1_id = ? THEN u2.avatar 
+                   ELSE u1.avatar 
+                 END as other_user_avatar,
+                 CASE 
+                   WHEN c.user1_id = ? THEN u2.status 
+                   ELSE u1.status 
+                 END as other_user_status,
+                 NULL as last_message,
+                 NULL as last_message_time,
+                 0 as unread_count
+          FROM conversations c
+          JOIN users u1 ON c.user1_id = u1.id
+          JOIN users u2 ON c.user2_id = u2.id
+          WHERE c.id = ?
+        `, [userId, userId, userId, userId, conversationId]);
+
         await conn.commit();
+
+        // Notifier les deux utilisateurs de la nouvelle conversation
+        if (userSockets.has(userId)) {
+          userSockets.get(userId).forEach(socketId => {
+            io.to(socketId).emit('new-conversation', newConversation[0]);
+          });
+        }
+
+        if (userSockets.has(otherUserId)) {
+          userSockets.get(otherUserId).forEach(socketId => {
+            io.to(socketId).emit('new-conversation', {
+              ...newConversation[0],
+              other_user_id: userId,
+              other_user_name: newConversation[0].other_user_name, // À ajuster selon la logique
+              other_user_avatar: newConversation[0].other_user_avatar // À ajuster selon la logique
+            });
+          });
+        }
         
         res.json({ 
           success: true, 
-          conversationId: result.insertId 
+          conversationId,
+          conversation: newConversation[0]
         });
       } catch (err) {
         await conn.rollback();
@@ -800,7 +858,7 @@ const setupRoutes = () => {
   app.get("/api/messages/:conversationId", requireAuth, async (req, res) => {
     try {
       const conversationId = req.params.conversationId;
-      const userId = req.session.user.id;
+      const userId = req.userId;
 
       // Vérification que l'utilisateur fait partie de la conversation
       const [conversation] = await pool.query(
@@ -873,7 +931,7 @@ const setupRoutes = () => {
     }
 
     const { conversationId } = req.body;
-    const userId = req.session.user.id;
+    const userId = req.userId;
     const fileUrl = `/uploads/messages/${req.file.filename}`;
     const fileType = req.file.mimetype;
 
@@ -933,17 +991,8 @@ const setupRoutes = () => {
         is_read: false
       };
 
-      // Émission via Socket.io
-      const recipientSocketId = onlineUsers.get(otherUserId);
-      if (recipientSocketId) {
-        io.to(recipientSocketId).emit('new-message', messageData);
-        messageData.is_read = true;
-      }
-
-      const senderSocketId = onlineUsers.get(userId);
-      if (senderSocketId) {
-        io.to(senderSocketId).emit('message-sent', messageData);
-      }
+      // Émission via Socket.io à la room de conversation
+      io.to(`conversation_${conversationId}`).emit('new-message', messageData);
 
       // Mise à jour des conversations
       await updateConversationForUsers(conn, conversationId, userId, otherUserId);
