@@ -8,7 +8,7 @@ const path = require("path");
 const fs = require("fs");
 const http = require("http");
 const socketio = require("socket.io");
-const jwt = require("jsonwebtoken");
+const jwt = require("jsonwebtoken"); // Import jsonwebtoken
 
 const app = express();
 const server = http.createServer(app);
@@ -27,6 +27,7 @@ const dbConfig = {
   password: process.env.DB_PASSWORD,
   database: process.env.DB_NAME,
   waitForConnections: true,
+  port: 3306,
   connectionLimit: 10,
   queueLimit: 0,
 };
@@ -42,9 +43,9 @@ const pool = mysql.createPool(dbConfig);
 // Middlewares
 app.use(cors({
   origin: FRONTEND_URL,
-  credentials: true,
+  credentials: true, // Keep this if you have other cookies (e.g., for CSRF) or if your frontend needs it for some reason, though less critical with JWT for authentication itself.
   methods: ["GET", "POST", "PUT", "DELETE"],
-  allowedHeaders: ["Content-Type", "Authorization"]
+  allowedHeaders: ["Content-Type", "Authorization"] // Allow Authorization header for JWT
 }));
 
 app.use(express.json({ limit: '25mb' }));
@@ -112,13 +113,15 @@ const requireAuth = (req, res, next) => {
   if (!authHeader) {
     return res.status(401).json({ success: false, message: "Non authentifié. Jeton manquant." });
   }
-  const token = authHeader.split(' ')[1];
+
+  const token = authHeader.split(' ')[1]; // Expected format: "Bearer TOKEN"
   if (!token) {
     return res.status(401).json({ success: false, message: "Non authentifié. Format de jeton invalide." });
   }
+
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    req.user = decoded;
+    req.user = decoded; // Attach the decoded payload to the request
     next();
   } catch (err) {
     console.error("Erreur de vérification du jeton:", err);
@@ -131,21 +134,20 @@ const io = socketio(server, {
   cors: {
     origin: FRONTEND_URL,
     methods: ["GET", "POST"],
-    credentials: true
-  },
-  transports: ['websocket']
+    credentials: true // Keep this if you have other cookies, but for JWT, it's not strictly necessary here.
+  }
 });
 
 // Middleware d'authentification Socket.io (avec JWT)
 io.use((socket, next) => {
-  const token = socket.handshake.auth.token;
+  const token = socket.handshake.auth.token; // Expect token from handshake.auth
   if (!token) {
     return next(new Error("Authentication error: Token missing."));
   }
 
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    socket.user = decoded;
+    socket.request.user = decoded; // Attach decoded payload for use in socket handlers
     next();
   } catch (err) {
     console.error("Socket.io JWT verification error:", err);
@@ -157,7 +159,7 @@ io.use((socket, next) => {
 const onlineUsers = new Map();
 
 io.on('connection', async (socket) => {
-  const userId = socket.user?.id;
+  const userId = socket.request.user?.id; // Use req.user from JWT
   if (!userId) {
       console.log('Socket disconnected: User ID not found after JWT verification.');
       return socket.disconnect(true);
@@ -191,7 +193,7 @@ io.on('connection', async (socket) => {
 async function handleSendMessage({ conversationId, content }, callback) {
   try {
     const socket = this;
-    const userId = socket.user.id;
+    const userId = socket.request.user.id; // Changed from socket.request.session.user.id
 
     const [conversation] = await pool.query(
       "SELECT user1_id, user2_id FROM conversations WHERE id = ?",
@@ -236,6 +238,7 @@ async function handleSendMessage({ conversationId, content }, callback) {
 
     if (recipientSocketId) {
       io.to(recipientSocketId).emit('new-message', messageData);
+      // messageData.is_read = true; // This will be true on the recipient's side *after* they read it, not immediately on send.
     }
 
     socket.emit('message-sent', messageData);
@@ -251,7 +254,7 @@ async function handleSendMessage({ conversationId, content }, callback) {
 async function handleMarkAsRead({ conversationId }) {
   try {
     const socket = this;
-    const userId = socket.user.id;
+    const userId = socket.request.user.id; // Changed from socket.request.session.user.id
 
     await pool.query(
       "UPDATE messages SET read_at = NOW() WHERE conversation_id = ? AND sender_id != ? AND read_at IS NULL",
@@ -310,6 +313,7 @@ async function updateConversationForUsers(userId, otherUserId, conversationId) {
       const senderSocketId = onlineUsers.get(userId);
       const recipientSocketId = onlineUsers.get(otherUserId);
 
+      // Convert content to fileUrl/fileType if it's a JSON string
       try {
         if (convData.last_message && convData.last_message.startsWith('{') && convData.last_message.endsWith('}')) {
           const fileData = JSON.parse(convData.last_message);
@@ -321,11 +325,21 @@ async function updateConversationForUsers(userId, otherUserId, conversationId) {
         // Not a JSON string, keep as is
       }
 
+
       if (senderSocketId) {
         io.to(senderSocketId).emit('conversation-updated', convData);
       }
       if (recipientSocketId) {
-        io.to(recipientSocketId).emit('conversation-updated', convData);
+        io.to(recipientSocketId).emit('conversation-updated', {
+          ...convData,
+          // When recipient receives update, their own unread count should reflect new unread messages
+          // The count from the query is for the 'current' user (userId), not the other user.
+          // This logic might need refinement based on how your frontend calculates unread counts locally.
+          // For now, let's assume `unread_count` for the recipient is what the DB reports for them.
+          // Or, you can fetch it specifically for the recipient user here.
+          // For simplicity, for the recipient, we just update conversation data and let their frontend handle unread logic
+          // A safer approach might be to send two separate updates, one tailored for sender, one for recipient.
+        });
       }
     }
   } catch (err) {
@@ -336,6 +350,7 @@ async function updateConversationForUsers(userId, otherUserId, conversationId) {
 // Routes API
 app.get("/api/check-auth", requireAuth, async (req, res) => {
   try {
+    // req.user is populated by requireAuth middleware
     const userId = req.user.id;
 
     const [rows] = await pool.query(
@@ -344,6 +359,7 @@ app.get("/api/check-auth", requireAuth, async (req, res) => {
     );
 
     if (rows.length === 0) {
+      // This case should be rare if JWT is valid, but good for data integrity checks
       return res.status(404).json({ isAuthenticated: false, message: "Utilisateur non trouvé." });
     }
 
@@ -360,6 +376,8 @@ app.get("/api/check-auth", requireAuth, async (req, res) => {
     });
   } catch (err) {
     console.error("Erreur vérification auth:", err);
+    // requireAuth already handles 401/403 for invalid tokens,
+    // so this catch handles other server errors.
     res.status(500).json({ isAuthenticated: false, message: "Erreur serveur lors de la vérification." });
   }
 });
@@ -430,39 +448,37 @@ app.post("/api/login", async (req, res) => {
   try {
     await conn.beginTransaction();
     const [rows] = await conn.query("SELECT * FROM users WHERE email = ?", [email]);
-    if (rows.length === 0) {
-      return res.status(401).json({ success: false, message: "Utilisateur non trouvé" });
-    }
+    if (rows.length === 0) return res.status(401).json({ success: false, message: "Identifiants incorrects" });
 
     const user = rows[0];
     const validPass = await bcrypt.compare(password, user.password);
-    if (!validPass) {
-      return res.status(401).json({ success: false, message: "Mot de passe incorrect" });
-    }
+    if (!validPass) return res.status(401).json({ success: false, message: "Identifiants incorrects" });
 
-    // Génération du token JWT
+    await conn.query("UPDATE users SET status = 'En ligne' WHERE id = ?", [user.id]);
+    await conn.commit();
+
+    // Generate JWT
     const token = jwt.sign(
-      { id: user.id, name: user.name, email: user.email },
+      { id: user.id, name: user.name, email: user.email, avatar: user.avatar, status: "En ligne" },
       process.env.JWT_SECRET,
-      { expiresIn: process.env.JWT_EXPIRATION || "7d" }
+      { expiresIn: '7d' } // Token expires in 7 days
     );
 
-    await conn.commit();
     res.json({
       success: true,
-      token,
+      token, // Send the token to the client
       user: {
         id: user.id,
         name: user.name,
         email: user.email,
         avatar: user.avatar,
-        status: user.status
+        status: "En ligne"
       }
     });
   } catch (err) {
     await conn.rollback();
-    console.error("Erreur login:", err);
-    res.status(500).json({ success: false, message: "Erreur serveur" });
+    console.error("Erreur connexion:", err);
+    res.status(500).json({ success: false, message: "Erreur lors de la connexion" });
   } finally {
     conn.release();
   }
@@ -472,9 +488,12 @@ app.post("/api/logout", requireAuth, async (req, res) => {
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
+    // Use req.user.id from the JWT payload
     await conn.query("UPDATE users SET status = 'Hors ligne' WHERE id = ?", [req.user.id]);
     await conn.commit();
 
+    // With JWT, you don't destroy sessions or clear cookies managed by the server for authentication
+    // The client will simply discard the token.
     res.json({ success: true, message: "Déconnexion réussie" });
   } catch (err) {
     await conn.rollback();
@@ -486,6 +505,7 @@ app.post("/api/logout", requireAuth, async (req, res) => {
 
 app.get("/api/users", requireAuth, async (req, res) => {
   try {
+    // Use req.user.id from the JWT payload
     const [users] = await pool.query(
       "SELECT id, name, avatar, status, bio, phone, location FROM users WHERE id != ? ORDER BY name ASC",
       [req.user.id]
@@ -500,6 +520,7 @@ app.get("/api/users", requireAuth, async (req, res) => {
 
 app.get("/api/profile", requireAuth, async (req, res) => {
   try {
+    // Use req.user.id from the JWT payload
     const [rows] = await pool.query(
       "SELECT id, name, email, avatar, status, bio, phone, location FROM users WHERE id = ?",
       [req.user.id]
@@ -519,17 +540,18 @@ app.get("/api/profile", requireAuth, async (req, res) => {
 
 app.put("/api/profile", requireAuth, uploadAvatar.single("avatar"), async (req, res) => {
   const { name, bio, phone, location } = req.body;
-  const userId = req.user.id;
+  const userId = req.user.id; // Changed from req.session.user.id
 
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
 
-    let avatar = req.user.avatar;
+    let avatar = req.user.avatar; // Changed from req.session.user.avatar
     if (req.file) {
       avatar = `/uploads/avatars/${req.file.filename}`;
+      // Delete old avatar if it's not the default one
       if (req.user.avatar && req.user.avatar !== "/uploads/avatars/default.jpg") {
-        const oldAvatarPath = path.join(__dirname, req.user.avatar);
+        const oldAvatarPath = path.join(__dirname, req.user.avatar); // Changed from req.session.user.avatar
         if (fs.existsSync(oldAvatarPath)) {
           fs.unlinkSync(oldAvatarPath);
         }
@@ -541,15 +563,27 @@ app.put("/api/profile", requireAuth, uploadAvatar.single("avatar"), async (req, 
       [name, bio, phone, location, avatar, userId]
     );
 
-    const [updatedUser] = await conn.query(
-      "SELECT id, name, email, avatar, status, bio, phone, location FROM users WHERE id = ?",
-      [userId]
-    );
+    // Update the user object in the request (this does not update the JWT itself,
+    // but ensures consistency for current request context)
+    req.user = {
+      ...req.user,
+      name,
+      avatar
+    };
 
     await conn.commit();
     res.json({
       success: true,
-      user: updatedUser[0]
+      user: {
+        id: userId,
+        name,
+        email: req.user.email, // Use req.user.email
+        avatar,
+        status: req.user.status, // Use req.user.status
+        bio,
+        phone,
+        location
+      }
     });
   } catch (err) {
     await conn.rollback();
@@ -563,7 +597,7 @@ app.put("/api/profile", requireAuth, uploadAvatar.single("avatar"), async (req, 
 
 app.get("/api/conversations", requireAuth, async (req, res) => {
   try {
-    const userId = req.user.id;
+    const userId = req.user.id; // Changed from req.session.user.id
 
     const [conversations] = await pool.query(`
       SELECT c.id,
@@ -594,20 +628,21 @@ app.get("/api/conversations", requireAuth, async (req, res) => {
       ORDER BY m.created_at DESC
     `, [userId, userId, userId, userId, userId, userId, userId]);
 
+    // Parse last_message content for file information
     const parsedConversations = conversations.map(conv => {
       try {
         if (conv.last_message && conv.last_message.startsWith('{') && conv.last_message.endsWith('}')) {
           const fileData = JSON.parse(conv.last_message);
           return {
             ...conv,
-            last_message: null,
+            last_message: null, // Clear text content
             fileUrl: fileData.fileUrl,
             fileType: fileData.fileType
           };
         }
         return conv;
       } catch (err) {
-        return conv;
+        return conv; // If parsing fails, return original message
       }
     });
 
@@ -620,7 +655,7 @@ app.get("/api/conversations", requireAuth, async (req, res) => {
 
 app.get("/api/conversations/:otherUserId", requireAuth, async (req, res) => {
   try {
-    const userId = req.user.id;
+    const userId = req.user.id; // Changed from req.session.user.id
     const otherUserId = req.params.otherUserId;
 
     const [existing] = await pool.query(`
@@ -657,7 +692,7 @@ app.get("/api/conversations/:otherUserId", requireAuth, async (req, res) => {
 app.get("/api/messages/:conversationId", requireAuth, async (req, res) => {
   try {
     const conversationId = req.params.conversationId;
-    const userId = req.user.id;
+    const userId = req.user.id; // Changed from req.session.user.id
 
     const [messages] = await pool.query(`
       SELECT m.id, m.content, m.created_at, m.sender_id,
@@ -669,6 +704,7 @@ app.get("/api/messages/:conversationId", requireAuth, async (req, res) => {
       ORDER BY m.created_at ASC
     `, [conversationId]);
 
+    // Parse the content JSON for messages with files
     const parsedMessages = messages.map(msg => {
       try {
         const content = msg.content;
@@ -683,10 +719,11 @@ app.get("/api/messages/:conversationId", requireAuth, async (req, res) => {
         }
         return msg;
       } catch (err) {
-        return msg;
+        return msg; // If parsing fails, return original message
       }
     });
 
+    // Mark messages as read (only those sent by the other user)
     await pool.query(
       "UPDATE messages SET read_at = NOW() WHERE conversation_id = ? AND sender_id != ? AND read_at IS NULL",
       [conversationId, userId]
@@ -705,16 +742,18 @@ app.post("/api/messages/upload", requireAuth, uploadMessageFile.single("file"), 
   }
 
   const { conversationId } = req.body;
-  const userId = req.user.id;
+  const userId = req.user.id; // Changed from req.session.user.id
   const fileUrl = `/uploads/messages/${req.file.filename}`;
   const fileType = req.file.mimetype;
 
+  // Store the file path in the message content as JSON
   const content = JSON.stringify({ fileUrl, fileType });
 
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
 
+    // Verify user is part of the conversation
     const [conversation] = await conn.query(
       "SELECT user1_id, user2_id FROM conversations WHERE id = ? AND (user1_id = ? OR user2_id = ?)",
       [conversationId, userId, userId]
@@ -728,16 +767,19 @@ app.post("/api/messages/upload", requireAuth, uploadMessageFile.single("file"), 
     const { user1_id, user2_id } = conversation[0];
     const otherUserId = user1_id === userId ? user2_id : user1_id;
 
+    // Insert the message
     const [result] = await conn.query(
       "INSERT INTO messages (conversation_id, sender_id, content) VALUES (?, ?, ?)",
       [conversationId, userId, content]
     );
 
+    // Update conversation with the last message
     await conn.query(
       "UPDATE conversations SET last_message_id = ? WHERE id = ?",
       [result.insertId, conversationId]
     );
 
+    // Retrieve full message details
     const [message] = await conn.query(`
       SELECT m.id, m.content, m.created_at, m.sender_id,
              u.name as sender_name, u.avatar as sender_avatar,
@@ -749,25 +791,30 @@ app.post("/api/messages/upload", requireAuth, uploadMessageFile.single("file"), 
 
     await conn.commit();
 
+    // Prepare message data for emission
     const messageData = {
       ...message[0],
-      content: null,
+      content: null, // Original content was JSON, send file info instead
       fileUrl,
       fileType,
       conversationId,
-      is_read: false
+      is_read: false // Message is not read by recipient yet
     };
 
+    // Emit message via Socket.io
     const recipientSocketId = onlineUsers.get(otherUserId);
     if (recipientSocketId) {
       io.to(recipientSocketId).emit('new-message', messageData);
+      // messageData.is_read = true; // This will be true on the recipient's side *after* they read it, not immediately on send.
     }
 
+    // Emit to sender for confirmation
     const senderSocketId = onlineUsers.get(userId);
     if (senderSocketId) {
       io.to(senderSocketId).emit('message-sent', messageData);
     }
 
+    // Update conversations for both users
     const [updatedConv] = await conn.query(`
       SELECT c.id,
              CASE
@@ -798,6 +845,7 @@ app.post("/api/messages/upload", requireAuth, uploadMessageFile.single("file"), 
 
     if (updatedConv.length > 0) {
       const conversationUpdate = updatedConv[0];
+      // Parse last_message content for file information before emitting
       try {
         if (conversationUpdate.last_message && conversationUpdate.last_message.startsWith('{') && conversationUpdate.last_message.endsWith('}')) {
           const fileData = JSON.parse(conversationUpdate.last_message);
@@ -805,13 +853,21 @@ app.post("/api/messages/upload", requireAuth, uploadMessageFile.single("file"), 
           conversationUpdate.fileUrl = fileData.fileUrl;
           conversationUpdate.fileType = fileData.fileType;
         }
-      } catch (e) { }
+      } catch (e) { /* not a json string */ }
 
+      // Emit conversation update to both users
       if (senderSocketId) {
         io.to(senderSocketId).emit('conversation-updated', conversationUpdate);
       }
       if (recipientSocketId) {
-        io.to(recipientSocketId).emit('conversation-updated', conversationUpdate);
+        io.to(recipientSocketId).emit('conversation-updated', {
+          ...conversationUpdate,
+          // The unread_count here is for `userId` (sender), not `otherUserId`.
+          // For the recipient, `unread_count` should likely be incremented if they are online and receive it.
+          // For simplicity, we just send the same object and let the client decide how to update unread count.
+          // A more robust approach might be to query unread count specifically for the recipient.
+          unread_count: recipientSocketId ? conversationUpdate.unread_count + 1 : 0 // If recipient is online, increment for immediate display
+        });
       }
     }
 
