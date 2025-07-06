@@ -8,7 +8,8 @@ const path = require("path");
 const fs = require("fs");
 const http = require("http");
 const socketio = require("socket.io");
-const jwt = require("jsonwebtoken"); // Import jsonwebtoken
+const { v4: uuidv4 } = require("uuid");
+const jwt = require("jsonwebtoken");
 
 const app = express();
 const server = http.createServer(app);
@@ -50,6 +51,10 @@ app.use(cors({
 
 app.use(express.json({ limit: '25mb' }));
 app.use(express.urlencoded({ extended: true, limit: '25mb' }));
+
+// Configuration JWT
+const JWT_SECRET = process.env.JWT_SECRET || "une_cle_secrete_complexe_et_longue";
+const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || "1d";
 
 // Configuration des dossiers d'upload
 const uploadsDir = path.join(__dirname, "uploads");
@@ -157,6 +162,7 @@ io.use((socket, next) => {
 
 // Gestion des connexions Socket.io
 const onlineUsers = new Map();
+const userSockets = new Map();
 
 io.on('connection', async (socket) => {
   const userId = socket.request.user?.id; // Use req.user from JWT
