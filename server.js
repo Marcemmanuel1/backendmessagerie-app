@@ -19,7 +19,7 @@ const server = http.createServer(app);
 // Configuration Socket.io avec CORS
 const io = socketio(server, {
   cors: {
-    origin: process.env.CLIENT_URL || "https://messagerie-app.vercel.app",
+    origin: process.env.CLIENT_URL || "https://nexuchat.onrender.com",
     methods: ["GET", "POST"],
     credentials: true
   },
@@ -44,7 +44,7 @@ const sessionStore = new MySQLStore({}, pool);
 
 // Middlewares
 app.use(cors({
-  origin: process.env.CLIENT_URL || "https://messagerie-app.vercel.app",
+  origin: process.env.CLIENT_URL || "https://nexuchat.onrender.com",
   credentials: true,
   methods: ["GET", "POST", "PUT", "DELETE"],
   allowedHeaders: ["Content-Type", "Authorization"]
