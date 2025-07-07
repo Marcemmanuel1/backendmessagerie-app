@@ -43,9 +43,9 @@ const pool = mysql.createPool(dbConfig);
 // Middlewares
 app.use(cors({
   origin: FRONTEND_URL,
-  credentials: true, // Keep this if you have other cookies (e.g., for CSRF) or if your frontend needs it for some reason, though less critical with JWT for authentication itself.
+  credentials: true,
   methods: ["GET", "POST", "PUT", "DELETE"],
-  allowedHeaders: ["Content-Type", "Authorization"] // Allow Authorization header for JWT
+  allowedHeaders: ["Content-Type", "Authorization"]
 }));
 
 app.use(express.json({ limit: '25mb' }));
@@ -134,7 +134,7 @@ const io = socketio(server, {
   cors: {
     origin: FRONTEND_URL,
     methods: ["GET", "POST"],
-    credentials: true // Keep this if you have other cookies, but for JWT, it's not strictly necessary here.
+    credentials: true
   }
 });
 
@@ -193,7 +193,7 @@ io.on('connection', async (socket) => {
 async function handleSendMessage({ conversationId, content }, callback) {
   try {
     const socket = this;
-    const userId = socket.request.user.id; // Changed from socket.request.session.user.id
+    const userId = socket.request.user.id;
 
     const [conversation] = await pool.query(
       "SELECT user1_id, user2_id FROM conversations WHERE id = ?",
@@ -238,11 +238,11 @@ async function handleSendMessage({ conversationId, content }, callback) {
 
     if (recipientSocketId) {
       io.to(recipientSocketId).emit('new-message', messageData);
-      // messageData.is_read = true; // This will be true on the recipient's side *after* they read it, not immediately on send.
     }
 
     socket.emit('message-sent', messageData);
-    updateConversationForUsers(userId, otherUserId, conversationId);
+    // Use the improved updateConversationForUsers
+    await updateConversationForUsers(userId, otherUserId, conversationId);
 
     callback({ success: true, message: messageData });
   } catch (err) {
@@ -254,7 +254,7 @@ async function handleSendMessage({ conversationId, content }, callback) {
 async function handleMarkAsRead({ conversationId }) {
   try {
     const socket = this;
-    const userId = socket.request.user.id; // Changed from socket.request.session.user.id
+    const userId = socket.request.user.id;
 
     await pool.query(
       "UPDATE messages SET read_at = NOW() WHERE conversation_id = ? AND sender_id != ? AND read_at IS NULL",
@@ -271,80 +271,89 @@ async function handleMarkAsRead({ conversationId }) {
       const { user1_id, user2_id } = conversation[0];
       const otherUserId = user1_id === userId ? user2_id : user1_id;
 
-      updateConversationForUsers(userId, otherUserId, conversationId);
+      // Use the improved updateConversationForUsers
+      await updateConversationForUsers(userId, otherUserId, conversationId);
     }
   } catch (err) {
     console.error("Erreur marquage messages comme lus:", err);
   }
 }
 
-async function updateConversationForUsers(userId, otherUserId, conversationId) {
-  try {
-    const [conversation] = await pool.query(`
-      SELECT c.id,
-             CASE
-               WHEN c.user1_id = ? THEN u2.id
-               ELSE u1.id
-             END as other_user_id,
-             CASE
-               WHEN c.user1_id = ? THEN u2.name
-               ELSE u1.name
-             END as other_user_name,
-             CASE
-               WHEN c.user1_id = ? THEN u2.avatar
-               ELSE u1.avatar
-             END as other_user_avatar,
-             CASE
-               WHEN c.user1_id = ? THEN u2.status
-               ELSE u1.status
-             END as other_user_status,
-             m.content as last_message,
-             m.created_at as last_message_time,
-             (SELECT COUNT(*) FROM messages WHERE conversation_id = c.id AND sender_id != ? AND read_at IS NULL) as unread_count
-      FROM conversations c
-      JOIN users u1 ON c.user1_id = u1.id
-      JOIN users u2 ON c.user2_id = u2.id
-      LEFT JOIN messages m ON c.last_message_id = m.id
-      WHERE c.id = ?
-    `, [userId, userId, userId, userId, userId, conversationId]);
+// Improved function for updating conversation data and emitting to both users
+async function updateConversationForUsers(actorUserId, otherUserId, conversationId) {
+    try {
+        const fetchConvData = async (currentUserId) => {
+            const [convRows] = await pool.query(`
+                SELECT c.id,
+                       CASE WHEN c.user1_id = ? THEN u2.id ELSE u1.id END as other_user_id,
+                       CASE WHEN c.user1_id = ? THEN u2.name ELSE u1.name END as other_user_name,
+                       CASE WHEN c.user1_id = ? THEN u2.avatar ELSE u1.avatar END as other_user_avatar,
+                       CASE WHEN c.user1_id = ? THEN u2.status ELSE u1.status END as other_user_status,
+                       m.content as last_message,
+                       m.created_at as last_message_time,
+                       (SELECT COUNT(*) FROM messages WHERE conversation_id = c.id AND sender_id != ? AND read_at IS NULL) as unread_count
+                FROM conversations c
+                JOIN users u1 ON c.user1_id = u1.id
+                JOIN users u2 ON c.user2_id = u2.id
+                LEFT JOIN messages m ON c.last_message_id = m.id
+                WHERE c.id = ?
+            `, [currentUserId, currentUserId, currentUserId, currentUserId, currentUserId, conversationId]);
+            return convRows[0];
+        };
 
-    if (conversation.length > 0) {
-      const convData = conversation[0];
-      const senderSocketId = onlineUsers.get(userId);
-      const recipientSocketId = onlineUsers.get(otherUserId);
+        const processConversationDataForEmit = (convData) => {
+            if (!convData) return null;
+            try {
+                if (convData.last_message && convData.last_message.startsWith('{') && convData.last_message.endsWith('}')) {
+                    const fileData = JSON.parse(convData.last_message);
+                    return {
+                        ...convData,
+                        last_message: null,
+                        fileUrl: fileData.fileUrl,
+                        fileType: fileData.fileType
+                    };
+                }
+                return convData;
+            } catch (e) {
+                return convData;
+            }
+        };
 
-      // Convert content to fileUrl/fileType if it's a JSON string
-      try {
-        if (convData.last_message && convData.last_message.startsWith('{') && convData.last_message.endsWith('}')) {
-          const fileData = JSON.parse(convData.last_message);
-          convData.last_message = null;
-          convData.fileUrl = fileData.fileUrl;
-          convData.fileType = fileData.fileType;
+        const actorConvData = processConversationDataForEmit(await fetchConvData(actorUserId));
+        const otherUserConvData = processConversationDataForEmit(await fetchConvData(otherUserId));
+
+        const actorSocketId = onlineUsers.get(actorUserId);
+        const otherUserSocketId = onlineUsers.get(otherUserId);
+
+        if (actorSocketId && actorConvData) {
+            io.to(actorSocketId).emit('conversation-updated', actorConvData);
         }
-      } catch (e) {
-        // Not a JSON string, keep as is
-      }
+        if (otherUserSocketId && otherUserConvData) {
+            io.to(otherUserSocketId).emit('conversation-updated', otherUserConvData);
+        }
 
+        // Emit 'messages-marked-read' event to the user who sent the messages that were just read
+        // This allows them to update their UI (e.g., "seen" status)
+        if (actorUserId && otherUserId && actorSocketId && otherUserSocketId) {
+            // Check if any messages from 'otherUserId' to 'actorUserId' in this conversation are now read
+            const [unreadMsgsFromOther] = await pool.query(`
+                SELECT id FROM messages WHERE conversation_id = ? AND sender_id = ? AND read_at IS NULL
+            `, [conversationId, otherUserId]);
 
-      if (senderSocketId) {
-        io.to(senderSocketId).emit('conversation-updated', convData);
-      }
-      if (recipientSocketId) {
-        io.to(recipientSocketId).emit('conversation-updated', {
-          ...convData,
-          // When recipient receives update, their own unread count should reflect new unread messages
-          // The count from the query is for the 'current' user (userId), not the other user.
-          // This logic might need refinement based on how your frontend calculates unread counts locally.
-          // For now, let's assume `unread_count` for the recipient is what the DB reports for them.
-          // Or, you can fetch it specifically for the recipient user here.
-          // For simplicity, for the recipient, we just update conversation data and let their frontend handle unread logic
-          // A safer approach might be to send two separate updates, one tailored for sender, one for recipient.
-        });
-      }
+            // If there are no more unread messages from 'otherUserId' in this conversation
+            // from the perspective of 'actorUserId' (i.e., actorUserId has read them all)
+            if (unreadMsgsFromOther.length === 0) {
+                io.to(otherUserSocketId).emit('messages-marked-read', {
+                    conversationId: conversationId,
+                    readerId: actorUserId, // The user who read the messages
+                    lastMessageReadId: actorConvData ? actorConvData.last_message_id : null // Optionally send the ID of the last message read
+                });
+            }
+        }
+
+    } catch (err) {
+        console.error("Erreur mise à jour conversation:", err);
     }
-  } catch (err) {
-    console.error("Erreur mise à jour conversation:", err);
-  }
 }
 
 // Routes API
@@ -359,7 +368,6 @@ app.get("/api/check-auth", requireAuth, async (req, res) => {
     );
 
     if (rows.length === 0) {
-      // This case should be rare if JWT is valid, but good for data integrity checks
       return res.status(404).json({ isAuthenticated: false, message: "Utilisateur non trouvé." });
     }
 
@@ -376,8 +384,6 @@ app.get("/api/check-auth", requireAuth, async (req, res) => {
     });
   } catch (err) {
     console.error("Erreur vérification auth:", err);
-    // requireAuth already handles 401/403 for invalid tokens,
-    // so this catch handles other server errors.
     res.status(500).json({ isAuthenticated: false, message: "Erreur serveur lors de la vérification." });
   }
 });
@@ -417,8 +423,8 @@ app.post("/api/register", uploadAvatar.single("avatar"), async (req, res) => {
 
     await conn.query(
       `INSERT INTO users
-        (name, email, password, avatar, status, bio, phone, location)
-        VALUES (?, ?, ?, ?, 'Hors ligne', '', '', '')`,
+         (name, email, password, avatar, status, bio, phone, location)
+         VALUES (?, ?, ?, ?, 'Hors ligne', '', '', '')`,
       [name, email, hashedPassword, avatar]
     );
 
@@ -488,12 +494,9 @@ app.post("/api/logout", requireAuth, async (req, res) => {
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
-    // Use req.user.id from the JWT payload
     await conn.query("UPDATE users SET status = 'Hors ligne' WHERE id = ?", [req.user.id]);
     await conn.commit();
 
-    // With JWT, you don't destroy sessions or clear cookies managed by the server for authentication
-    // The client will simply discard the token.
     res.json({ success: true, message: "Déconnexion réussie" });
   } catch (err) {
     await conn.rollback();
@@ -505,7 +508,6 @@ app.post("/api/logout", requireAuth, async (req, res) => {
 
 app.get("/api/users", requireAuth, async (req, res) => {
   try {
-    // Use req.user.id from the JWT payload
     const [users] = await pool.query(
       "SELECT id, name, avatar, status, bio, phone, location FROM users WHERE id != ? ORDER BY name ASC",
       [req.user.id]
@@ -520,7 +522,6 @@ app.get("/api/users", requireAuth, async (req, res) => {
 
 app.get("/api/profile", requireAuth, async (req, res) => {
   try {
-    // Use req.user.id from the JWT payload
     const [rows] = await pool.query(
       "SELECT id, name, email, avatar, status, bio, phone, location FROM users WHERE id = ?",
       [req.user.id]
@@ -540,18 +541,17 @@ app.get("/api/profile", requireAuth, async (req, res) => {
 
 app.put("/api/profile", requireAuth, uploadAvatar.single("avatar"), async (req, res) => {
   const { name, bio, phone, location } = req.body;
-  const userId = req.user.id; // Changed from req.session.user.id
+  const userId = req.user.id;
 
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
 
-    let avatar = req.user.avatar; // Changed from req.session.user.avatar
+    let avatar = req.user.avatar;
     if (req.file) {
       avatar = `/uploads/avatars/${req.file.filename}`;
-      // Delete old avatar if it's not the default one
       if (req.user.avatar && req.user.avatar !== "/uploads/avatars/default.jpg") {
-        const oldAvatarPath = path.join(__dirname, req.user.avatar); // Changed from req.session.user.avatar
+        const oldAvatarPath = path.join(__dirname, req.user.avatar);
         if (fs.existsSync(oldAvatarPath)) {
           fs.unlinkSync(oldAvatarPath);
         }
@@ -563,8 +563,6 @@ app.put("/api/profile", requireAuth, uploadAvatar.single("avatar"), async (req, 
       [name, bio, phone, location, avatar, userId]
     );
 
-    // Update the user object in the request (this does not update the JWT itself,
-    // but ensures consistency for current request context)
     req.user = {
       ...req.user,
       name,
@@ -577,9 +575,9 @@ app.put("/api/profile", requireAuth, uploadAvatar.single("avatar"), async (req, 
       user: {
         id: userId,
         name,
-        email: req.user.email, // Use req.user.email
+        email: req.user.email,
         avatar,
-        status: req.user.status, // Use req.user.status
+        status: req.user.status,
         bio,
         phone,
         location
@@ -597,7 +595,7 @@ app.put("/api/profile", requireAuth, uploadAvatar.single("avatar"), async (req, 
 
 app.get("/api/conversations", requireAuth, async (req, res) => {
   try {
-    const userId = req.user.id; // Changed from req.session.user.id
+    const userId = req.user.id;
 
     const [conversations] = await pool.query(`
       SELECT c.id,
@@ -628,21 +626,20 @@ app.get("/api/conversations", requireAuth, async (req, res) => {
       ORDER BY m.created_at DESC
     `, [userId, userId, userId, userId, userId, userId, userId]);
 
-    // Parse last_message content for file information
     const parsedConversations = conversations.map(conv => {
       try {
         if (conv.last_message && conv.last_message.startsWith('{') && conv.last_message.endsWith('}')) {
           const fileData = JSON.parse(conv.last_message);
           return {
             ...conv,
-            last_message: null, // Clear text content
+            last_message: null,
             fileUrl: fileData.fileUrl,
             fileType: fileData.fileType
           };
         }
         return conv;
       } catch (err) {
-        return conv; // If parsing fails, return original message
+        return conv;
       }
     });
 
@@ -655,7 +652,7 @@ app.get("/api/conversations", requireAuth, async (req, res) => {
 
 app.get("/api/conversations/:otherUserId", requireAuth, async (req, res) => {
   try {
-    const userId = req.user.id; // Changed from req.session.user.id
+    const userId = req.user.id;
     const otherUserId = req.params.otherUserId;
 
     const [existing] = await pool.query(`
@@ -676,7 +673,42 @@ app.get("/api/conversations/:otherUserId", requireAuth, async (req, res) => {
       );
       await conn.commit();
 
-      res.json({ success: true, conversationId: result.insertId });
+      const newConversationId = result.insertId;
+
+      // --- NEW: Emit new-conversation event to both users ---
+      const fetchConvDataForNew = async (currentUserId, targetOtherUserId, convId) => {
+          const [rows] = await conn.query(`
+              SELECT c.id,
+                     CASE WHEN c.user1_id = ? THEN u2.id ELSE u1.id END as other_user_id,
+                     CASE WHEN c.user1_id = ? THEN u2.name ELSE u1.name END as other_user_name,
+                     CASE WHEN c.user1_id = ? THEN u2.avatar ELSE u1.avatar END as other_user_avatar,
+                     CASE WHEN c.user1_id = ? THEN u2.status ELSE u1.status END as other_user_status,
+                     NULL as last_message,
+                     NULL as last_message_time,
+                     0 as unread_count
+              FROM conversations c
+              JOIN users u1 ON c.user1_id = u1.id
+              JOIN users u2 ON c.user2_id = u2.id
+              WHERE c.id = ?
+          `, [currentUserId, currentUserId, currentUserId, currentUserId, convId]);
+          return rows[0];
+      };
+
+      const senderConvData = await fetchConvDataForNew(userId, otherUserId, newConversationId);
+      const recipientConvData = await fetchConvDataForNew(otherUserId, userId, newConversationId);
+
+      const senderSocketId = onlineUsers.get(userId);
+      const recipientSocketId = onlineUsers.get(otherUserId);
+
+      if (senderSocketId && senderConvData) {
+        io.to(senderSocketId).emit('new-conversation', senderConvData);
+      }
+      if (recipientSocketId && recipientConvData) {
+        io.to(recipientSocketId).emit('new-conversation', recipientConvData);
+      }
+      // --- END NEW ---
+
+      res.json({ success: true, conversationId: newConversationId });
     } catch (err) {
       await conn.rollback();
       throw err;
@@ -692,7 +724,7 @@ app.get("/api/conversations/:otherUserId", requireAuth, async (req, res) => {
 app.get("/api/messages/:conversationId", requireAuth, async (req, res) => {
   try {
     const conversationId = req.params.conversationId;
-    const userId = req.user.id; // Changed from req.session.user.id
+    const userId = req.user.id;
 
     const [messages] = await pool.query(`
       SELECT m.id, m.content, m.created_at, m.sender_id,
@@ -704,7 +736,6 @@ app.get("/api/messages/:conversationId", requireAuth, async (req, res) => {
       ORDER BY m.created_at ASC
     `, [conversationId]);
 
-    // Parse the content JSON for messages with files
     const parsedMessages = messages.map(msg => {
       try {
         const content = msg.content;
@@ -719,7 +750,7 @@ app.get("/api/messages/:conversationId", requireAuth, async (req, res) => {
         }
         return msg;
       } catch (err) {
-        return msg; // If parsing fails, return original message
+        return msg;
       }
     });
 
@@ -728,6 +759,19 @@ app.get("/api/messages/:conversationId", requireAuth, async (req, res) => {
       "UPDATE messages SET read_at = NOW() WHERE conversation_id = ? AND sender_id != ? AND read_at IS NULL",
       [conversationId, userId]
     );
+
+    // After marking as read, ensure conversation lists are updated for both users involved
+    // This is important to clear unread counts on the sender's (who reads) side,
+    // and potentially to update "seen" status on the other user's side.
+    const [conversationParticipants] = await pool.query(
+        "SELECT user1_id, user2_id FROM conversations WHERE id = ?",
+        [conversationId]
+    );
+    if (conversationParticipants.length > 0) {
+        const { user1_id, user2_id } = conversationParticipants[0];
+        const otherUserId = user1_id === userId ? user2_id : user1_id;
+        await updateConversationForUsers(userId, otherUserId, conversationId);
+    }
 
     res.json({ success: true, messages: parsedMessages });
   } catch (err) {
@@ -742,18 +786,16 @@ app.post("/api/messages/upload", requireAuth, uploadMessageFile.single("file"), 
   }
 
   const { conversationId } = req.body;
-  const userId = req.user.id; // Changed from req.session.user.id
+  const userId = req.user.id;
   const fileUrl = `/uploads/messages/${req.file.filename}`;
   const fileType = req.file.mimetype;
 
-  // Store the file path in the message content as JSON
   const content = JSON.stringify({ fileUrl, fileType });
 
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
 
-    // Verify user is part of the conversation
     const [conversation] = await conn.query(
       "SELECT user1_id, user2_id FROM conversations WHERE id = ? AND (user1_id = ? OR user2_id = ?)",
       [conversationId, userId, userId]
@@ -767,19 +809,16 @@ app.post("/api/messages/upload", requireAuth, uploadMessageFile.single("file"), 
     const { user1_id, user2_id } = conversation[0];
     const otherUserId = user1_id === userId ? user2_id : user1_id;
 
-    // Insert the message
     const [result] = await conn.query(
       "INSERT INTO messages (conversation_id, sender_id, content) VALUES (?, ?, ?)",
       [conversationId, userId, content]
     );
 
-    // Update conversation with the last message
     await conn.query(
       "UPDATE conversations SET last_message_id = ? WHERE id = ?",
       [result.insertId, conversationId]
     );
 
-    // Retrieve full message details
     const [message] = await conn.query(`
       SELECT m.id, m.content, m.created_at, m.sender_id,
              u.name as sender_name, u.avatar as sender_avatar,
@@ -791,85 +830,27 @@ app.post("/api/messages/upload", requireAuth, uploadMessageFile.single("file"), 
 
     await conn.commit();
 
-    // Prepare message data for emission
     const messageData = {
       ...message[0],
-      content: null, // Original content was JSON, send file info instead
+      content: null,
       fileUrl,
       fileType,
       conversationId,
-      is_read: false // Message is not read by recipient yet
+      is_read: false
     };
 
-    // Emit message via Socket.io
     const recipientSocketId = onlineUsers.get(otherUserId);
     if (recipientSocketId) {
       io.to(recipientSocketId).emit('new-message', messageData);
-      // messageData.is_read = true; // This will be true on the recipient's side *after* they read it, not immediately on send.
     }
 
-    // Emit to sender for confirmation
     const senderSocketId = onlineUsers.get(userId);
     if (senderSocketId) {
       io.to(senderSocketId).emit('message-sent', messageData);
     }
 
-    // Update conversations for both users
-    const [updatedConv] = await conn.query(`
-      SELECT c.id,
-             CASE
-               WHEN c.user1_id = ? THEN u2.id
-               ELSE u1.id
-             END as other_user_id,
-             CASE
-               WHEN c.user1_id = ? THEN u2.name
-               ELSE u1.name
-             END as other_user_name,
-             CASE
-               WHEN c.user1_id = ? THEN u2.avatar
-               ELSE u1.avatar
-             END as other_user_avatar,
-             CASE
-               WHEN c.user1_id = ? THEN u2.status
-               ELSE u1.status
-             END as other_user_status,
-             m.content as last_message,
-             m.created_at as last_message_time,
-             (SELECT COUNT(*) FROM messages WHERE conversation_id = c.id AND sender_id != ? AND read_at IS NULL) as unread_count
-      FROM conversations c
-      JOIN users u1 ON c.user1_id = u1.id
-      JOIN users u2 ON c.user2_id = u2.id
-      LEFT JOIN messages m ON c.last_message_id = m.id
-      WHERE c.id = ?
-    `, [userId, userId, userId, userId, userId, conversationId]);
-
-    if (updatedConv.length > 0) {
-      const conversationUpdate = updatedConv[0];
-      // Parse last_message content for file information before emitting
-      try {
-        if (conversationUpdate.last_message && conversationUpdate.last_message.startsWith('{') && conversationUpdate.last_message.endsWith('}')) {
-          const fileData = JSON.parse(conversationUpdate.last_message);
-          conversationUpdate.last_message = null;
-          conversationUpdate.fileUrl = fileData.fileUrl;
-          conversationUpdate.fileType = fileData.fileType;
-        }
-      } catch (e) { /* not a json string */ }
-
-      // Emit conversation update to both users
-      if (senderSocketId) {
-        io.to(senderSocketId).emit('conversation-updated', conversationUpdate);
-      }
-      if (recipientSocketId) {
-        io.to(recipientSocketId).emit('conversation-updated', {
-          ...conversationUpdate,
-          // The unread_count here is for `userId` (sender), not `otherUserId`.
-          // For the recipient, `unread_count` should likely be incremented if they are online and receive it.
-          // For simplicity, we just send the same object and let the client decide how to update unread count.
-          // A more robust approach might be to query unread count specifically for the recipient.
-          unread_count: recipientSocketId ? conversationUpdate.unread_count + 1 : 0 // If recipient is online, increment for immediate display
-        });
-      }
-    }
+    // Use the improved updateConversationForUsers
+    await updateConversationForUsers(userId, otherUserId, conversationId);
 
     res.json({
       success: true,
